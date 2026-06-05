@@ -1,0 +1,31 @@
+{
+  "super_admins": {
+    "type": "list",
+    "description": "超级管理员 QQ 号",
+    "hint": "这里填写的用户可以结束游戏或处决挂机玩家。房主不需要填写，也拥有创建房间的管理权。",
+    "default": []
+  },
+  "whitelist_groups": {
+    "type": "list",
+    "description": "群聊白名单",
+    "hint": "若填写，则插件仅在这些群生效。",
+    "default": []
+  },
+  "blacklist_groups": {
+    "type": "list",
+    "description": "群聊黑名单",
+    "hint": "这些群将禁用本插件。",
+    "default": []
+  },
+  "max_players": {
+    "type": "int",
+    "description": "最大玩家数",
+    "hint": "v0.1 规则设计上限为 6 人，不建议调高。",
+    "default": 6,
+    "slider": {
+      "min": 2,
+      "max": 6,
+      "step": 1
+    }
+  }
+}

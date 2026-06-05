@@ -1,0 +1,703 @@
+import json
+import os
+import random
+import time
+from typing import Any
+
+import astrbot.api.message_components as Comp
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star
+from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+
+
+ITEMS = ["放大镜", "香烟", "啤酒", "手铐", "短刀"]
+
+
+def load_json(path: str, default: Any) -> Any:
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"读取简单的轮盘赌数据失败: {e}")
+        return default
+
+
+def save_json(path: str, data: Any) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"保存简单的轮盘赌数据失败: {e}")
+
+
+def normalize_ids(values: Any) -> set[str]:
+    if not isinstance(values, (list, tuple, set)):
+        return set()
+    return {str(v).strip() for v in values if str(v).strip()}
+
+
+def strip_command(text: str, command_names: list[str]) -> str:
+    raw = (text or "").strip()
+    for name in command_names:
+        for prefix in ("/", "!", ""):
+            token = f"{prefix}{name}"
+            if raw == token:
+                return ""
+            if raw.startswith(token + " "):
+                return raw[len(token):].strip()
+    return raw
+
+
+def extract_target_id(event: AstrMessageEvent, fallback_text: str = "") -> str | None:
+    for component in getattr(event.message_obj, "message", []):
+        if isinstance(component, Comp.At):
+            return str(component.qq)
+
+    text = fallback_text or str(getattr(event, "message_str", "") or "")
+    for marker in ("qq=", "@"):
+        if marker in text:
+            after = text.split(marker, 1)[1]
+            digits = ""
+            for ch in after:
+                if ch.isdigit():
+                    digits += ch
+                elif digits:
+                    break
+            if digits:
+                return digits
+    return None
+
+
+class DevilRoulettePlugin(Star):
+    def __init__(self, context: Context, config: AstrBotConfig = None):
+        super().__init__(context)
+        self.config = config or {}
+        self.data_dir = os.path.join(get_astrbot_plugin_data_path(), "devil_roulette")
+        self.rooms_file = os.path.join(self.data_dir, "rooms.json")
+        self.rooms: dict[str, dict] = load_json(self.rooms_file, {})
+        logger.info(f"简单的轮盘赌插件已加载，数据目录: {self.data_dir}")
+
+    def _save(self) -> None:
+        save_json(self.rooms_file, self.rooms)
+
+    def _is_group_allowed(self, group_id: str) -> bool:
+        whitelist = normalize_ids(self.config.get("whitelist_groups", []))
+        blacklist = normalize_ids(self.config.get("blacklist_groups", []))
+        if group_id in blacklist:
+            return False
+        return not whitelist or group_id in whitelist
+
+    def _super_admins(self) -> set[str]:
+        return normalize_ids(self.config.get("super_admins", []))
+
+    def _is_manager(self, room: dict, user_id: str) -> bool:
+        return user_id == str(room.get("owner_id")) or user_id in self._super_admins()
+
+    def _group_id_or_reply(self, event: AstrMessageEvent) -> tuple[str | None, str | None]:
+        if event.is_private_chat():
+            return None, "此游戏仅支持群聊。"
+        group_id = str(event.get_group_id())
+        if not self._is_group_allowed(group_id):
+            return None, None
+        return group_id, None
+
+    def _player_profile(self, count: int) -> dict:
+        if count == 2:
+            return {
+                "hp": 5,
+                "item_start_round": 3,
+                "item_count": 2,
+                "max_items": 6,
+                "early_rounds": 2,
+                "early_max_bullets": 4,
+            }
+        if count <= 4:
+            return {
+                "hp": 3,
+                "item_start_round": 3,
+                "item_count": 2,
+                "max_items": 4,
+                "early_rounds": 3,
+                "early_max_bullets": 6,
+            }
+        return {
+            "hp": 2,
+            "item_start_round": 2,
+            "item_count": 1,
+            "max_items": 3,
+            "early_rounds": 0,
+            "early_max_bullets": 10,
+        }
+
+    def _new_player(self, event: AstrMessageEvent) -> dict:
+        user_id = str(event.get_sender_id())
+        name = event.get_sender_name() or f"玩家{user_id}"
+        return {
+            "id": user_id,
+            "name": name,
+            "hp": 1,
+            "max_hp": 1,
+            "items": [],
+            "alive": True,
+            "skipped": False,
+            "damage_bonus": 0,
+        }
+
+    def _alive_ids(self, room: dict) -> list[str]:
+        players = room["players"]
+        return [pid for pid in players if room["player_map"][pid].get("alive")]
+
+    def _player_name(self, room: dict, user_id: str) -> str:
+        player = room["player_map"].get(str(user_id))
+        return player.get("name", f"玩家{user_id}") if player else f"玩家{user_id}"
+
+    def _current_id(self, room: dict) -> str | None:
+        alive = self._alive_ids(room)
+        if not alive:
+            return None
+        players = room["players"]
+        idx = int(room.get("turn_index", 0)) % len(players)
+        for offset in range(len(players)):
+            pid = players[(idx + offset) % len(players)]
+            if pid in alive:
+                room["turn_index"] = (idx + offset) % len(players)
+                return pid
+        return None
+
+    def _refill_item_bag(self, room: dict) -> None:
+        bag = ITEMS[:]
+        random.shuffle(bag)
+        room["item_bag"] = bag
+
+    def _draw_item(self, room: dict) -> str:
+        if not room.get("item_bag"):
+            self._refill_item_bag(room)
+        return room["item_bag"].pop()
+
+    def _reload_chamber(self, room: dict) -> list[str]:
+        room["round_no"] = int(room.get("round_no", 0)) + 1
+        profile = room["rules"]
+        max_bullets = 10
+        if room["round_no"] <= profile["early_rounds"]:
+            max_bullets = profile["early_max_bullets"]
+
+        total = random.randint(3, max_bullets)
+        live_count = random.randint(1, total - 1)
+        chamber = [True] * live_count + [False] * (total - live_count)
+        random.shuffle(chamber)
+
+        room["chamber"] = chamber
+        room["known_live"] = live_count
+        room["known_blank"] = total - live_count
+
+        lines = [
+            f"第 {room['round_no']} 个弹仓轮开始。",
+            f"本轮装填 {total} 发：实弹 {live_count} 发，空弹 {total - live_count} 发。",
+            "顺序未知。",
+        ]
+
+        if room["round_no"] >= profile["item_start_round"]:
+            lines.extend(self._deal_items(room))
+        return lines
+
+    def _deal_items(self, room: dict) -> list[str]:
+        profile = room["rules"]
+        lines = ["开始发放道具："]
+        any_dealt = False
+        for pid in self._alive_ids(room):
+            player = room["player_map"][pid]
+            gained = []
+            for _ in range(profile["item_count"]):
+                if len(player["items"]) >= profile["max_items"]:
+                    break
+                item = self._draw_item(room)
+                player["items"].append(item)
+                gained.append(item)
+            if gained:
+                any_dealt = True
+                lines.append(f"- {player['name']} 获得：{'、'.join(gained)}")
+            else:
+                lines.append(f"- {player['name']} 背包已满，未获得道具")
+        return lines if any_dealt else ["所有存活玩家背包已满，本轮不发放道具。"]
+
+    def _remaining_bullets_text(self, room: dict) -> str:
+        chamber = room.get("chamber", [])
+        live = sum(1 for b in chamber if b)
+        blank = len(chamber) - live
+        return f"剩余 {len(chamber)} 发：实弹 {live} 发，空弹 {blank} 发"
+
+    def _advance_turn(self, room: dict) -> list[str]:
+        lines = []
+        alive = self._alive_ids(room)
+        if len(alive) <= 1:
+            return lines
+
+        players = room["players"]
+        current_index = int(room.get("turn_index", 0)) % len(players)
+        for step in range(1, len(players) + 1):
+            idx = (current_index + step) % len(players)
+            pid = players[idx]
+            player = room["player_map"][pid]
+            if not player.get("alive"):
+                continue
+            if player.get("skipped"):
+                player["skipped"] = False
+                player["damage_bonus"] = 0
+                lines.append(f"{player['name']} 被跳过本回合，无法行动。")
+                continue
+            room["turn_index"] = idx
+            lines.append(f"轮到 {player['name']} 行动。")
+            return lines
+        return lines
+
+    def _finish_if_needed(self, group_id: str, room: dict) -> list[str]:
+        alive = self._alive_ids(room)
+        if len(alive) == 1:
+            winner = self._player_name(room, alive[0])
+            self.rooms.pop(group_id, None)
+            self._save()
+            return [f"游戏结束，胜者是：{winner}。"]
+        if len(alive) == 0:
+            self.rooms.pop(group_id, None)
+            self._save()
+            return ["游戏结束，无人生还。"]
+        return []
+
+    def _ensure_playing_turn(self, event: AstrMessageEvent, room: dict) -> str | None:
+        if room.get("status") != "playing":
+            return "游戏还没有开始。"
+        current_id = self._current_id(room)
+        user_id = str(event.get_sender_id())
+        if current_id != user_id:
+            return f"现在轮到 {self._player_name(room, current_id)} 行动。"
+        return None
+
+    def _consume_item(self, player: dict, item: str) -> bool:
+        if item not in player["items"]:
+            return False
+        player["items"].remove(item)
+        return True
+
+    def _status_text(self, room: dict) -> str:
+        lines = [
+            f"简单的轮盘赌：{room['status']}",
+            f"房主：{self._player_name(room, room['owner_id'])}",
+        ]
+        if room.get("status") == "playing":
+            current = self._current_id(room)
+            lines.append(f"当前行动：{self._player_name(room, current)}")
+            lines.append(f"弹仓轮：{room.get('round_no', 0)}")
+            lines.append(self._remaining_bullets_text(room))
+        lines.append("玩家：")
+        for pid in room["players"]:
+            player = room["player_map"][pid]
+            state = "存活" if player.get("alive") else "出局"
+            skip = "，跳过待触发" if player.get("skipped") else ""
+            bonus = "，短刀已准备" if player.get("damage_bonus") else ""
+            items = "、".join(player.get("items", [])) or "无"
+            lines.append(
+                f"- {player['name']}：{player['hp']}/{player['max_hp']} 血，{state}{skip}{bonus}，道具：{items}"
+            )
+        return "\n".join(lines)
+
+    @filter.command("轮盘创建", alias={"轮盘创建", "创建轮盘", "drcreate"})
+    async def create_room(self, event: AstrMessageEvent):
+        group_id, error = self._group_id_or_reply(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        if not group_id:
+            return
+
+        room = self.rooms.get(group_id)
+        if room:
+            yield event.plain_result("本群已经有轮盘赌房间了。")
+            return
+
+        owner = self._new_player(event)
+        self.rooms[group_id] = {
+            "group_id": group_id,
+            "owner_id": owner["id"],
+            "status": "waiting",
+            "created_at": int(time.time()),
+            "players": [owner["id"]],
+            "player_map": {owner["id"]: owner},
+            "turn_index": 0,
+            "round_no": 0,
+            "chamber": [],
+            "item_bag": [],
+            "rules": {},
+        }
+        self._save()
+        yield event.plain_result(
+            f"{owner['name']} 创建了轮盘赌房间。\n"
+            "发送 /轮盘加入 加入游戏，2 到 6 人后由房主发送 /轮盘开始。"
+        )
+
+    @filter.command("轮盘加入", alias={"加入轮盘", "drjoin"})
+    async def join_room(self, event: AstrMessageEvent):
+        group_id, error = self._group_id_or_reply(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        if not group_id:
+            return
+
+        room = self.rooms.get(group_id)
+        if not room:
+            yield event.plain_result("本群还没有房间，请先发送 /轮盘创建。")
+            return
+        if room.get("status") != "waiting":
+            yield event.plain_result("游戏已经开始，不能中途加入。")
+            return
+
+        user_id = str(event.get_sender_id())
+        if user_id in room["player_map"]:
+            yield event.plain_result("你已经在房间里了。")
+            return
+
+        max_players = min(6, int(self.config.get("max_players", 6)))
+        if len(room["players"]) >= max_players:
+            yield event.plain_result(f"房间已满，最多 {max_players} 人。")
+            return
+
+        player = self._new_player(event)
+        room["players"].append(player["id"])
+        room["player_map"][player["id"]] = player
+        self._save()
+        yield event.plain_result(
+            f"{player['name']} 加入了房间。\n当前人数：{len(room['players'])}/{max_players}"
+        )
+
+    @filter.command("轮盘开始", alias={"开始轮盘", "drstart"})
+    async def start_room(self, event: AstrMessageEvent):
+        group_id, error = self._group_id_or_reply(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        if not group_id:
+            return
+
+        room = self.rooms.get(group_id)
+        if not room:
+            yield event.plain_result("本群还没有房间。")
+            return
+        user_id = str(event.get_sender_id())
+        if not self._is_manager(room, user_id):
+            yield event.plain_result("只有房主或超级管理员可以开始游戏。")
+            return
+        if room.get("status") != "waiting":
+            yield event.plain_result("游戏已经开始。")
+            return
+        count = len(room["players"])
+        if count < 2:
+            yield event.plain_result("至少需要 2 名玩家才能开始。")
+            return
+        if count > 6:
+            yield event.plain_result("v0.1 最多支持 6 名玩家。")
+            return
+
+        profile = self._player_profile(count)
+        room["rules"] = profile
+        for player in room["player_map"].values():
+            player["hp"] = profile["hp"]
+            player["max_hp"] = profile["hp"]
+            player["alive"] = True
+            player["items"] = []
+            player["skipped"] = False
+            player["damage_bonus"] = 0
+
+        random.shuffle(room["players"])
+        room["turn_index"] = 0
+        room["status"] = "playing"
+        self._refill_item_bag(room)
+        lines = [
+            f"游戏开始，共 {count} 名玩家。",
+            f"本局每人 {profile['hp']} 血，最多持有 {profile['max_items']} 个道具。",
+            "行动顺序：" + " -> ".join(self._player_name(room, pid) for pid in room["players"]),
+        ]
+        lines.extend(self._reload_chamber(room))
+        lines.append(f"首先行动：{self._player_name(room, self._current_id(room))}")
+        self._save()
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("开自己", alias={"轮盘开自己", "drself"})
+    async def shoot_self(self, event: AstrMessageEvent):
+        async for result in self._shoot(event, target_self=True):
+            yield result
+
+    @filter.command("开", alias={"开枪", "轮盘开枪", "drshoot"})
+    async def shoot_target(self, event: AstrMessageEvent):
+        async for result in self._shoot(event, target_self=False):
+            yield result
+
+    async def _shoot(self, event: AstrMessageEvent, target_self: bool):
+        group_id, error = self._group_id_or_reply(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        if not group_id:
+            return
+
+        room = self.rooms.get(group_id)
+        if not room:
+            yield event.plain_result("本群没有进行中的房间。")
+            return
+        turn_error = self._ensure_playing_turn(event, room)
+        if turn_error:
+            yield event.plain_result(turn_error)
+            return
+
+        shooter_id = str(event.get_sender_id())
+        if target_self:
+            target_id = shooter_id
+        else:
+            target_id = extract_target_id(event)
+            if not target_id:
+                yield event.plain_result("请 @ 一名要射击的玩家。")
+                return
+
+        if target_id not in room["player_map"] or not room["player_map"][target_id].get("alive"):
+            yield event.plain_result("目标不在本局游戏中，或已经出局。")
+            return
+
+        if not room.get("chamber"):
+            lines = self._reload_chamber(room)
+        else:
+            lines = []
+
+        shooter = room["player_map"][shooter_id]
+        target = room["player_map"][target_id]
+        bullet = room["chamber"].pop(0)
+        damage = 1 + int(shooter.get("damage_bonus", 0))
+        shooter["damage_bonus"] = 0
+
+        if bullet:
+            target["hp"] -= damage
+            lines.append(
+                f"{shooter['name']} 对 {target['name']} 开枪：实弹，造成 {damage} 点伤害。"
+            )
+            if target["hp"] <= 0:
+                target["hp"] = 0
+                target["alive"] = False
+                target["skipped"] = False
+                target["damage_bonus"] = 0
+                lines.append(f"{target['name']} 出局。")
+        else:
+            lines.append(f"{shooter['name']} 对 {target['name']} 开枪：空弹。")
+
+        finish_lines = self._finish_if_needed(group_id, room)
+        if finish_lines:
+            lines.extend(finish_lines)
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if not room.get("chamber"):
+            lines.extend(self._reload_chamber(room))
+
+        if target_self and not bullet and shooter.get("alive"):
+            lines.append(f"{shooter['name']} 对自己打出空弹，继续行动。")
+        else:
+            lines.extend(self._advance_turn(room))
+
+        self._save()
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("使用道具", alias={"用道具", "使用", "dritem"})
+    async def use_item(self, event: AstrMessageEvent):
+        group_id, error = self._group_id_or_reply(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        if not group_id:
+            return
+
+        room = self.rooms.get(group_id)
+        if not room:
+            yield event.plain_result("本群没有进行中的房间。")
+            return
+        turn_error = self._ensure_playing_turn(event, room)
+        if turn_error:
+            yield event.plain_result(turn_error)
+            return
+
+        args = strip_command(event.message_str, ["使用道具", "用道具", "使用", "dritem"])
+        item = None
+        for candidate in ITEMS:
+            if candidate in args:
+                item = candidate
+                break
+        if not item:
+            yield event.plain_result("请指定道具：放大镜、香烟、啤酒、手铐、短刀。")
+            return
+
+        user_id = str(event.get_sender_id())
+        player = room["player_map"][user_id]
+        lines = []
+
+        if item == "香烟":
+            if player["hp"] >= player["max_hp"]:
+                yield event.plain_result("你的血量已满，不能使用香烟。")
+                return
+            if not self._consume_item(player, item):
+                yield event.plain_result("你没有这个道具。")
+                return
+            player["hp"] += 1
+            lines.append(f"{player['name']} 使用香烟，回复 1 血。当前 {player['hp']}/{player['max_hp']} 血。")
+
+        elif item == "放大镜":
+            if not room.get("chamber"):
+                lines.extend(self._reload_chamber(room))
+            if not self._consume_item(player, item):
+                yield event.plain_result("你没有这个道具。")
+                return
+            bullet_text = "实弹" if room["chamber"][0] else "空弹"
+            lines.append(f"{player['name']} 使用放大镜。当前子弹是：{bullet_text}。")
+
+        elif item == "啤酒":
+            if not room.get("chamber"):
+                lines.extend(self._reload_chamber(room))
+            if not self._consume_item(player, item):
+                yield event.plain_result("你没有这个道具。")
+                return
+            bullet = room["chamber"].pop(0)
+            lines.append(f"{player['name']} 使用啤酒，退掉了一发{'实弹' if bullet else '空弹'}。")
+            if not room.get("chamber"):
+                lines.extend(self._reload_chamber(room))
+
+        elif item == "短刀":
+            if player.get("damage_bonus"):
+                yield event.plain_result("你已经准备了短刀，不能重复使用。")
+                return
+            if not self._consume_item(player, item):
+                yield event.plain_result("你没有这个道具。")
+                return
+            player["damage_bonus"] = 1
+            lines.append(f"{player['name']} 使用短刀，下一枪若为实弹则伤害 +1。")
+
+        elif item == "手铐":
+            target_id = extract_target_id(event, args)
+            if not target_id:
+                yield event.plain_result("使用手铐需要 @ 一名存活玩家。")
+                return
+            if target_id == user_id:
+                yield event.plain_result("不能对自己使用手铐。")
+                return
+            target = room["player_map"].get(target_id)
+            if not target or not target.get("alive"):
+                yield event.plain_result("目标不在本局游戏中，或已经出局。")
+                return
+            if target.get("skipped"):
+                yield event.plain_result("目标已经被手铐限制，不能叠加。")
+                return
+            if not self._consume_item(player, item):
+                yield event.plain_result("你没有这个道具。")
+                return
+            target["skipped"] = True
+            lines.append(f"{player['name']} 对 {target['name']} 使用手铐。{target['name']} 的下一次行动将被完全跳过。")
+
+        self._save()
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("轮盘状态", alias={"轮盘状态", "drstatus"})
+    async def room_status(self, event: AstrMessageEvent):
+        group_id, error = self._group_id_or_reply(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        if not group_id:
+            return
+        room = self.rooms.get(group_id)
+        if not room:
+            yield event.plain_result("本群没有轮盘赌房间。")
+            return
+        yield event.plain_result(self._status_text(room))
+
+    @filter.command("轮盘处决", alias={"轮盘淘汰", "处决", "drexecute"})
+    async def execute_player(self, event: AstrMessageEvent):
+        group_id, error = self._group_id_or_reply(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        if not group_id:
+            return
+
+        room = self.rooms.get(group_id)
+        if not room:
+            yield event.plain_result("本群没有轮盘赌房间。")
+            return
+        user_id = str(event.get_sender_id())
+        if not self._is_manager(room, user_id):
+            yield event.plain_result("只有房主或超级管理员可以处决挂机玩家。")
+            return
+        target_id = extract_target_id(event)
+        if not target_id:
+            yield event.plain_result("请 @ 一名要处决的玩家。")
+            return
+        target = room["player_map"].get(target_id)
+        if not target or not target.get("alive"):
+            yield event.plain_result("目标不在本局游戏中，或已经出局。")
+            return
+
+        target["hp"] = 0
+        target["alive"] = False
+        target["skipped"] = False
+        target["damage_bonus"] = 0
+        lines = [f"{target['name']} 被判定为挂机，已被处决。"]
+
+        finish_lines = self._finish_if_needed(group_id, room)
+        if finish_lines:
+            lines.extend(finish_lines)
+            yield event.plain_result("\n".join(lines))
+            return
+
+        current = self._current_id(room)
+        if current == target_id:
+            lines.extend(self._advance_turn(room))
+        else:
+            lines.append(f"当前行动：{self._player_name(room, self._current_id(room))}")
+        self._save()
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("轮盘结束", alias={"结束轮盘", "drend"})
+    async def end_room(self, event: AstrMessageEvent):
+        group_id, error = self._group_id_or_reply(event)
+        if error:
+            yield event.plain_result(error)
+            return
+        if not group_id:
+            return
+        room = self.rooms.get(group_id)
+        if not room:
+            yield event.plain_result("本群没有轮盘赌房间。")
+            return
+        user_id = str(event.get_sender_id())
+        if not self._is_manager(room, user_id):
+            yield event.plain_result("只有房主或超级管理员可以结束游戏。")
+            return
+        self.rooms.pop(group_id, None)
+        self._save()
+        yield event.plain_result("本群轮盘赌房间已结束。")
+
+    @filter.command("轮盘帮助", alias={"轮盘帮助", "drhelp"})
+    async def help(self, event: AstrMessageEvent):
+        text = (
+            "简单的轮盘赌 v0.1\n"
+            "指令：\n"
+            "/轮盘创建 - 创建房间\n"
+            "/轮盘加入 - 加入房间\n"
+            "/轮盘开始 - 开始游戏\n"
+            "/开自己 - 对自己开枪\n"
+            "/开 @玩家 - 对指定玩家开枪\n"
+            "/使用道具 道具名 - 使用道具\n"
+            "/轮盘状态 - 查看状态\n"
+            "/轮盘处决 @玩家 - 房主/超级管理员处决挂机玩家\n"
+            "/轮盘结束 - 房主/超级管理员结束房间\n\n"
+            "道具：放大镜、香烟、啤酒、手铐、短刀。\n"
+            "放大镜结果公开；被手铐跳过时不能使用道具或开枪。"
+        )
+        yield event.plain_result(text)
