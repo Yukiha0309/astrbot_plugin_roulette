@@ -48,7 +48,7 @@ git clone https://github.com/Yukiha0309/astrbot-plugin-roulette.git
 然后重启 AstrBot，或在 AstrBot 插件管理页面重新加载插件。
 
 
-#更新内容
+## 更新内容
 V0.2
 - 新增 /使用手铐 @玩家、/使用啤酒 等短指令
 - 造成伤害后提示剩余生命
