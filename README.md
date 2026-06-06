@@ -70,6 +70,11 @@ git clone https://github.com/Yukiha0309/astrbot-plugin-roulette.git
 - `player_name_max_length`：玩家昵称截断长度。
 
 
+## 未来可能会做的计划
+
+- 加入Bot到游戏里
+- 自定义文案(例如:开火实弹，变成给“用户”塞过期食品。造成了一点伤害。这种）
+
 ## AI 声明与使用许可
 本仓库代码主要由 AI 辅助生成，并由仓库维护者整理、测试与发布。
 你可以自由学习、使用、修改、二次开发和分发本插件。具体授权以本仓库的 LICENSE 文件为准。
