@@ -20,11 +20,11 @@
   "max_players": {
     "type": "int",
     "description": "最大玩家数",
-    "hint": "v0.2.5 规则设计上限为 6 人，不建议调高。",
+    "hint": "默认 6。可以调高到 7 人或以上，但超过 6 人后平衡性与回合节奏可能下降。",
     "default": 6,
     "slider": {
       "min": 2,
-      "max": 6,
+      "max": 12,
       "step": 1
     }
   },
@@ -43,6 +43,23 @@
       "min": 4,
       "max": 20,
       "step": 1
+    }
+  },
+  "jiuhu_event_enabled": {
+    "type": "bool",
+    "description": "酒狐事件开关",
+    "hint": "仅异界战争模式生效。",
+    "default": true
+  },
+  "jiuhu_event_chance": {
+    "type": "int",
+    "description": "酒狐事件概率",
+    "hint": "每个弹仓轮开始时触发酒狐事件的概率，仅异界战争模式生效。推荐 30。",
+    "default": 30,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 5
     }
   }
 }
